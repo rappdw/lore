@@ -3,7 +3,10 @@
 
 Single-file, standard-library-only. v0a: source enumeration + adapter framework
 + the Claude adapter + read-only commands (ls/search/show/graph/stats/export).
-No LLM, no mutation, no non-Claude adapters (those are later increments).
+v0b: the token-overlap scorer + opt-in LLM commands (summarize/relevant) via the
+Anthropic Messages API over stdlib HTTP (no SDK; auth from ANTHROPIC_API_KEY in the
+env or $SANDY_HOME/.secrets). The read-only core stays fully functional with no key
+and no network. No mutation, no non-Claude adapters (later increments).
 """
 from __future__ import annotations
 
@@ -15,11 +18,13 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
 # ── §2  Constants ───────────────────────────────────────────────────────────
-LORE_VERSION = "0.1.1-dev"
+LORE_VERSION = "0.2.0-dev"
 LORE_COMMIT = ""  # baked at install time by install.sh; empty => "dev"
 DEFAULT_SANDY_HOME = os.path.expanduser("~/.sandy")
 VALID_TYPES = {"user", "feedback", "project", "reference"}
@@ -568,6 +573,17 @@ def collect_items(args):
     if getattr(args, "project", None):
         items = [it for it in items if args.project in (it.project, it.project_slug)]
     return items
+
+
+def collect_items_all(args):
+    """Like collect_items but ignores the `project` filter — `relevant` needs the
+    whole corpus to split into target-project vs. candidate-from-elsewhere."""
+    saved = getattr(args, "project", None)
+    args.project = None
+    try:
+        return collect_items(args)
+    finally:
+        args.project = saved
 
 
 def emit_coverage(args):
@@ -1178,6 +1194,321 @@ def cmd_session(args):
     return EXIT_OK
 
 
+# ── §10  Token-overlap scorer (SPEC §6.1 stage 1) ───────────────────────────
+# Deterministic, offline, no LLM. Built here for `relevant`'s shortlist; reused
+# by curation (dedup clustering) in a later increment. Shingle-Jaccard over
+# title+description+body, lowercased + destopworded.
+
+# A small, conventional English stoplist — enough to keep shingles signal-bearing
+# without pulling in a corpus. Kept short on purpose (single-file, no data files).
+_STOPWORDS = frozenset("""
+a an and are as at be but by for from has have if in into is it its of on or
+that the their then there these this to was were will with you your we our
+""".split())
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def tokenize(text: str):
+    """Lowercase word tokens, stopwords and 1-char tokens dropped."""
+    if not text:
+        return []
+    return [t for t in _TOKEN_RE.findall(text.lower())
+            if len(t) > 1 and t not in _STOPWORDS]
+
+
+def shingles(text, n_min: int = 2, n_max: int = 3):
+    """Set of n-gram shingles (n in [n_min, n_max]). Falls back to unigrams when
+    the token stream is too short to form any n-gram, so tiny texts still score."""
+    toks = tokenize(text)
+    if not toks:
+        return set()
+    out = set()
+    for n in range(n_min, n_max + 1):
+        for i in range(len(toks) - n + 1):
+            out.add(tuple(toks[i:i + n]))
+    if not out:  # fewer than n_min tokens → compare on the unigrams we have
+        out = {(t,) for t in toks}
+    return out
+
+
+def jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    return inter / len(a | b)
+
+
+def _item_text(it) -> str:
+    parts = [it.title or "", it.description or "", it.body or ""]
+    return "\n".join(p for p in parts if p)
+
+
+def _shingle_index(items):
+    """Precompute each item's shingle set once (clustering/ranking is O(n²))."""
+    return [(it, shingles(_item_text(it))) for it in items]
+
+
+def rank_relevant(target_items, candidate_items, top_n: int):
+    """Score each candidate by its MAX shingle-Jaccard against the target corpus
+    (SPEC §6.2). Returns [(item, score)] sorted desc, score>0 only, top_n kept."""
+    target_sh = [s for _, s in _shingle_index(target_items) if s]
+    if not target_sh:
+        return []
+    scored = []
+    for it, sh in _shingle_index(candidate_items):
+        if not sh:
+            continue
+        best = max(jaccard(sh, ts) for ts in target_sh)
+        if best > 0:
+            scored.append((it, best))
+    scored.sort(key=lambda r: (-r[1], -r[0].mtime, r[0].title.lower()))
+    return scored[:top_n]
+
+
+# ── §11  LLM integration (opt-in; SPEC §8) ──────────────────────────────────
+# `summarize` / `relevant --explain` call the Anthropic Messages API directly over
+# stdlib HTTP (urllib) — no third-party SDK, so the single-file/stdlib invariant
+# holds. lore runs HOST-side, where the agent CLIs (claude/codex/…) usually aren't
+# installed, so we authenticate with an API key rather than shelling out. We do NOT
+# accept a Claude Code OAuth token for the API (ToS-prohibited, enforced — §8). The
+# read-only core never calls this. Tests inject LLM_RUNNER to stub the model.
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+LLM_DEFAULT_MODEL = "claude-opus-4-8"
+LLM_MAX_TOKENS = 4096
+LLM_TIMEOUT_S = 120
+SUMMARIZE_CHAR_BUDGET = 12000   # per-call text budget; over this, map-reduce
+LLM_RUNNER = None               # test hook: callable(prompt, model) -> str
+
+
+class LLMUnavailable(Exception):
+    """No Anthropic credential is resolvable (read-only commands are unaffected)."""
+
+
+class LLMError(Exception):
+    """The Messages API call failed (HTTP error, network, timeout, refusal)."""
+
+
+def _sandy_home(args) -> str:
+    return (getattr(args, "sandy_home", None)
+            or os.environ.get("SANDY_HOME") or DEFAULT_SANDY_HOME)
+
+
+def _read_secrets(args):
+    """Parse `KEY=value` from `$SANDY_HOME/{.secrets,config}` — sandy's privileged-
+    tier credential store, read host-side. Tolerant: skips blanks/comments/malformed
+    lines, strips an optional `export ` and surrounding quotes. `.secrets` wins."""
+    out = {}
+    home = _sandy_home(args)
+    for fn in (".secrets", "config"):
+        path = os.path.join(home, fn)
+        if not os.path.isfile(path):
+            continue
+        for line in _read_text(path).splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            if k and k not in out:
+                out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _resolve_secret(name, args):
+    return os.environ.get(name) or _read_secrets(args).get(name)
+
+
+def _auth_headers(args):
+    """Anthropic auth headers, or None if no API key resolves. ONLY ANTHROPIC_API_KEY
+    is honored. A Claude Code subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) is
+    deliberately NOT accepted: routing it to /v1/messages from a non-Claude-Code
+    client violates Anthropic's Consumer Terms and is actively enforced (documented
+    account bans). Subscription-only users should generate an API key. See SPEC §8."""
+    key = _resolve_secret("ANTHROPIC_API_KEY", args)
+    if key:
+        return {"x-api-key": key}
+    return None
+
+
+def llm_available(args) -> bool:
+    return LLM_RUNNER is not None or _auth_headers(args) is not None
+
+
+def call_llm(prompt, args, model=None) -> str:
+    if LLM_RUNNER is not None:
+        return LLM_RUNNER(prompt, model)
+    headers = _auth_headers(args)
+    if headers is None:
+        raise LLMUnavailable(
+            "no ANTHROPIC_API_KEY — set it in the environment or $SANDY_HOME/.secrets")
+    model = model or os.environ.get("SANDY_MODEL") or LLM_DEFAULT_MODEL
+    body = json.dumps({
+        "model": model,
+        "max_tokens": LLM_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    req = urllib.request.Request(ANTHROPIC_API_URL, data=body, method="POST")
+    req.add_header("content-type", "application/json")
+    req.add_header("anthropic-version", ANTHROPIC_VERSION)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:  # pragma: no cover - best-effort error-body parse
+            pass
+        raise LLMError("Claude API HTTP %d%s" % (e.code, (": " + detail) if detail else ""))
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise LLMError("Claude API request failed: %s" % e)
+    if data.get("stop_reason") == "refusal":
+        raise LLMError("Claude declined the request (refusal)")
+    return "".join(b.get("text", "") for b in data.get("content", [])
+                   if b.get("type") == "text").strip()
+
+
+def _llm_model(args):
+    return getattr(args, "model", None)
+
+
+# ── §11a  summarize ──────────────────────────────────────────────────────────
+_SUMMARIZE_HEAD = (
+    "You are summarizing the persistent memory an AI coding agent has accumulated.\n"
+    "Produce a concise digest of what's been learned, grouped by theme. Call out any\n"
+    "contradictions between memories explicitly. Output GitHub-flavored markdown; do\n"
+    "not invent facts beyond the memories below.\n\n=== MEMORIES ===\n")
+
+_REDUCE_HEAD = (
+    "Below are partial summaries of an AI agent's accumulated memory. Merge them into\n"
+    "one coherent digest, grouped by theme, preserving any flagged contradictions and\n"
+    "removing redundancy. Output GitHub-flavored markdown.\n\n=== PARTIAL SUMMARIES ===\n")
+
+
+def _item_block(it) -> str:
+    head = "## %s  [%s/%s/%s]" % (it.title, it.agent, it.project, it.type or "unknown")
+    desc = ("\n_%s_" % it.description) if it.description else ""
+    return "%s%s\n\n%s" % (head, desc, (it.body or "").strip())
+
+
+def _chunk_blocks(blocks, budget):
+    """Greedily pack blocks into chunks under `budget` chars. A single oversized
+    block gets its own chunk (we never split mid-memory)."""
+    chunks, cur, cur_len = [], [], 0
+    for b in blocks:
+        if cur and cur_len + len(b) > budget:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append(b)
+        cur_len += len(b)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def cmd_summarize(args):
+    items = collect_items(args)
+    if not items:
+        if args.json:
+            emit_json({"summary": "", "items": 0, "model": _llm_model(args)})
+        else:
+            print("Nothing to summarize (no memories matched).")
+        return EXIT_OK
+    if not llm_available(args):
+        return die("no ANTHROPIC_API_KEY — set it in env or $SANDY_HOME/.secrets; "
+                   "the read-only commands work without it", EXIT_RUNTIME, args.json)
+    model = _llm_model(args)
+    blocks = [_item_block(it) for it in
+              sorted(items, key=lambda i: (i.project, i.agent, i.title.lower()))]
+    chunks = _chunk_blocks(blocks, SUMMARIZE_CHAR_BUDGET)
+    try:
+        partials = [call_llm(_SUMMARIZE_HEAD + "\n\n".join(c), args, model) for c in chunks]
+        summary = (partials[0] if len(partials) == 1
+                   else call_llm(_REDUCE_HEAD + "\n\n---\n\n".join(partials), args, model))
+    except LLMUnavailable as e:
+        return die(str(e), EXIT_RUNTIME, args.json)
+    except LLMError as e:
+        return die(str(e), EXIT_RUNTIME, args.json)
+    if args.json:
+        emit_json({"summary": summary, "items": len(items),
+                   "chunks": len(chunks), "model": model})
+        return EXIT_OK
+    print(summary)
+    return EXIT_OK
+
+
+# ── §11b  relevant ───────────────────────────────────────────────────────────
+_EXPLAIN_HEAD = (
+    "An AI coding agent is working in project '%s'. Below are memories from OTHER\n"
+    "projects/agents that a token-overlap heuristic flagged as possibly relevant.\n"
+    "For each, give a one-line rationale for whether it actually applies here, then\n"
+    "rank them most- to least-relevant. Advisory only — do not propose copying.\n"
+    "Output markdown.\n\n=== TARGET PROJECT CONTEXT ===\n%s\n\n=== CANDIDATES ===\n%s\n")
+
+
+def _candidate_line(it, score) -> str:
+    desc = (" — %s" % it.description) if it.description else ""
+    return "- [%.2f] %s [%s/%s/%s]%s" % (
+        score, it.title, it.agent, it.project, it.type or "unknown", desc)
+
+
+def cmd_relevant(args):
+    items = collect_items_all(args)
+    target = [it for it in items
+              if args.project in (it.project, it.project_slug)]
+    if not target:
+        return die("no memories found for project '%s' to compare against"
+                   % args.project, EXIT_RUNTIME, args.json)
+    target_slugs = set(it.project_slug for it in target)
+    candidates = [it for it in items if it.project_slug not in target_slugs]
+    ranked = rank_relevant(target, candidates, args.top)
+
+    if args.explain and ranked:
+        if not llm_available(args):
+            return die("no ANTHROPIC_API_KEY — `--explain` needs it; drop `--explain` "
+                       "for the offline ranked list", EXIT_RUNTIME, args.json)
+        ctx = "\n".join("- %s%s" % (it.title, (": " + it.description) if it.description else "")
+                        for it in target[:30])
+        cand = "\n".join(_candidate_line(it, s) for it, s in ranked)
+        try:
+            explanation = call_llm(
+                _EXPLAIN_HEAD % (args.project, ctx, cand), args, _llm_model(args))
+        except LLMUnavailable as e:
+            return die(str(e), EXIT_RUNTIME, args.json)
+        except LLMError as e:
+            return die(str(e), EXIT_RUNTIME, args.json)
+    else:
+        explanation = None
+
+    if args.json:
+        emit_json({"project": args.project,
+                   "candidates": [dict(it.to_json_dict(), score=round(s, 4))
+                                  for it, s in ranked],
+                   "count": len(ranked),
+                   "explanation": explanation})
+        return EXIT_OK
+    if not ranked:
+        print("No memories from other projects look relevant to '%s'." % args.project)
+        return EXIT_OK
+    print("Possibly relevant to '%s' (advisory — `copy` is the explicit step):"
+          % args.project)
+    for it, s in ranked:
+        print(_candidate_line(it, s))
+    if explanation:
+        print("\n— rationale —\n")
+        print(explanation)
+    return EXIT_OK
+
+
 # ── §12  argparse + main ────────────────────────────────────────────────────
 def build_parser():
     common = argparse.ArgumentParser(add_help=False)
@@ -1230,6 +1561,22 @@ def build_parser():
     p.add_argument("--md", action="store_true", help="markdown (default)")
     p.add_argument("--project")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("summarize", parents=[common],
+                       help="LLM digest of what's been learned (needs an Anthropic API key)")
+    p.add_argument("--type")
+    p.add_argument("--project")
+    p.add_argument("--model", help="LLM model (else $SANDY_MODEL, else claude default)")
+    p.set_defaults(func=cmd_summarize)
+
+    p = sub.add_parser("relevant", parents=[common],
+                       help="memories from elsewhere that may apply to a project")
+    p.add_argument("project", help="target project (label or slug)")
+    p.add_argument("--top", type=int, default=10, help="shortlist size (default 10)")
+    p.add_argument("--explain", action="store_true",
+                   help="LLM rerank with rationales (needs an Anthropic API key)")
+    p.add_argument("--model", help="LLM model (else $SANDY_MODEL, else claude default)")
+    p.set_defaults(func=cmd_relevant)
 
     p = sub.add_parser("sessions", parents=[common], help="list session profiles (transcripts)")
     p.add_argument("--project")

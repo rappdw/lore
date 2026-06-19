@@ -37,9 +37,9 @@ The foundation: the adapter framework, the Claude adapter, and the read-only com
 
 ## v0b — LLM: summarize & relate (target `0.2.0`)
 
-`summarize` + `relevant`, via `claude -p`. The v0a core stays fully functional without `claude`. Sequenced first after the core because it pays off immediately on the rich Claude memory that already exists.
+`summarize` + `relevant`, via the Anthropic Messages API over stdlib HTTP (no SDK). The v0a core stays fully functional with no credential and no network. Sequenced first after the core because it pays off immediately on the rich Claude memory that already exists.
 
-1. **LLM shim.** `claude -p` invocation (`--model`/`SANDY_MODEL`, timeout, clean "not found").
+1. **LLM shim.** `urllib` POST to `/v1/messages`; `ANTHROPIC_API_KEY` from env or `$SANDY_HOME/.secrets` (a Claude Code OAuth token is *not* accepted — ToS); `--model`/`SANDY_MODEL`; timeout; clean "no key" exit.
 2. **Token-overlap scorer (SPEC §6.1/§6.2 stage 1).** The shingle/Jaccard scorer — **built here, reused by curation (v0c)**. Deterministic, unit-tested offline (no LLM in CI).
 3. **`summarize`.** Selection → bounded prompt → digest; map-reduce over the char budget.
 4. **`relevant`.** Shortlist (via the scorer) → `--explain` LLM rerank with rationales; advisory only.

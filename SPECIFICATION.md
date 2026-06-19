@@ -94,7 +94,7 @@ Global flags: `--agent A[,B]`, `--source sandbox|host`, `--sandboxes-root <dir>`
 - **`stats`** — **coverage** (sandboxes *enumerated* vs. *with memory*, so a sparse result is legibly "no memory there", not a miss); counts by agent / type / project; index/file mismatches; dangling links; mtime growth. The coverage line is also emitted on stderr under `-v` for any command.
 - **`export`** `[--md | --json] [--agent A] [--project P]` — consolidated digest. `--json` is the stable machine schema (§4).
 
-### 5.2 LLM-powered (opt-in; require `claude` on `PATH`)
+### 5.2 LLM-powered (opt-in; require an Anthropic credential — see §8)
 - **`summarize`** `[--agent A] [--project P] [--type T] [--model M]` — digest "what's been learned," grouped by theme, flagging contradictions; map-reduced when the selection exceeds a char budget.
 - **`relevant <project>`** `[--model M] [--top N] [--explain]` — memories from *other* projects/agents that may apply here (§6.2); advisory only, never copies.
 
@@ -150,7 +150,7 @@ Provenance lookups are **cheap** — they list `*.jsonl` filenames (`session_id_
 
 ### 6.1 Duplicate / near-duplicate — two-stage
 1. **Cheap clustering (always).** Token-shingle (2–3-gram, lowercased, destopworded) Jaccard over `title`+`description`+`body`; cluster above `--threshold` (default `0.5`). Identical `title` across projects is an automatic candidate. Deterministic, offline. Cross-agent clusters are surfaced but flagged (an agent's phrasing differs).
-2. **Optional LLM adjudication (`--llm`).** Only candidate clusters go to `claude -p`, labeled `duplicate|overlapping|distinct|contradictory` with a proposed merge. Bounds LLM cost to clusters, not pairs.
+2. **Optional LLM adjudication (`--llm`).** Only candidate clusters go to the LLM (§8), labeled `duplicate|overlapping|distinct|contradictory` with a proposed merge. Bounds LLM cost to clusters, not pairs.
 
 ### 6.2 Cross-source relevance
 Shortlist by max token-overlap to the target project's corpus (top `N`, default 10) → opt-in LLM rerank with one-line rationales. Suggestion only; `copy` is the separate explicit step.
@@ -173,7 +173,11 @@ Flag when: `origin_session_id`'s sandbox no longer exists; or a `project`/`feedb
 
 ## 8. LLM integration
 
-Shell out to `claude -p "<prompt>"` (honoring `SANDY_MODEL`/`--model`); reuse the user's `claude` auth — no API key. Prompts use `title`+`description`+`body` text only. Output is advisory prose/suggestions, never written to a file without a subsequent explicit mutating command + `--apply`. Absent `claude` ⇒ LLM commands exit `1`; read-only commands unaffected.
+`summarize` / `relevant --explain` call the **Anthropic Messages API** directly over stdlib HTTP (`urllib`) — **no third-party SDK**, so the single-file / stdlib invariant holds. lore runs **host-side**, where the agent CLIs (`claude`/`codex`/…) are typically *not* installed, so auth is an **API key**, not a `claude` subprocess. The key is **`ANTHROPIC_API_KEY`** (sent as `x-api-key`), taken from the process env first, then `$SANDY_HOME/{.secrets,config}` (sandy's privileged-tier `KEY=value` store, where sandy itself reads agent credentials).
+
+A Claude Code subscription **OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`) is deliberately NOT accepted.** Routing it to `/v1/messages` from a non-Claude-Code client violates Anthropic's Consumer Terms of Service, is actively fingerprinted/enforced, and has resulted in account bans (Anthropic Legal-and-compliance docs; enforcement waves Jan–Apr 2026). Subscription-only users who want LLM features should generate an `ANTHROPIC_API_KEY`. (The only ToS-compliant way to use a subscription would be shelling out to the *official* `claude` CLI — out of scope: rarely present host-side, and a deliberately-omitted dependency.)
+
+Model honors `--model`/`SANDY_MODEL`, default `claude-opus-4-8`. Prompts use `title`+`description`+`body` text only. Output is advisory prose, never written to a file without a subsequent explicit mutating command + `--apply`. No API key ⇒ LLM commands exit `1`; the read-only core is unaffected and needs neither key nor network.
 
 ---
 
@@ -185,7 +189,8 @@ Shell out to `claude -p "<prompt>"` (honoring `SANDY_MODEL`/`--model`); reuse th
 | `--source` | `sandbox` (default) or `host` (post-v0) | `sandbox` |
 | `--agent` | restrict to agent(s) | all |
 | `--sandboxes-root` / `--sandy-home` | discovery overrides | from `SANDY_HOME` |
-| `SANDY_MODEL` / `--model` | LLM model | claude default |
+| `ANTHROPIC_API_KEY` | Anthropic API key for LLM commands (env or `$SANDY_HOME/.secrets`); the **only** accepted credential — see §8 | — |
+| `SANDY_MODEL` / `--model` | LLM model | `claude-opus-4-8` |
 | `--threshold` / `--stale-days` | dedup/relevance cutoff / stale age | `0.5` / `120` |
 
 ---
