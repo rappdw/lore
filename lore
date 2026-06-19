@@ -1509,6 +1509,97 @@ def cmd_relevant(args):
     return EXIT_OK
 
 
+# ── §11c  menu (interactive command picker) ─────────────────────────────────
+# A lightweight stdlib `input()` launcher — lists commands, prompts for the chosen
+# command's options, then dispatches. NOT a full TUI (the rich graph browser stays
+# deferred; see ROADMAP). Introspects build_parser() so it never drifts from the
+# real command set.
+
+_MENU_GLOBAL_DESTS = frozenset({
+    "agent", "source", "sandboxes_root", "sandy_home",
+    "include_instructions", "json", "v", "q", "help"})
+
+
+def _menu_subparsers_action(parser):
+    for a in parser._actions:
+        if isinstance(a, argparse._SubParsersAction):
+            return a
+    return None
+
+
+def _menu_prompt(label, choices=None):
+    hint = " [%s]" % "/".join(choices) if choices else ""
+    try:
+        return input("  %s%s> " % (label, hint)).strip()
+    except EOFError:
+        return ""
+
+
+def _menu_command_args(subparser):
+    """(positionals, optionals) for a subparser, command-specific only — the
+    common/global flags are handled separately (inherited from the menu call)."""
+    pos, opt = [], []
+    for a in subparser._actions:
+        if isinstance(a, argparse._HelpAction) or a.dest in _MENU_GLOBAL_DESTS:
+            continue
+        (opt if a.option_strings else pos).append(a)
+    return pos, opt
+
+
+def cmd_menu(args):
+    parser = build_parser()
+    sub = _menu_subparsers_action(parser)
+    if sub is None:  # pragma: no cover - argparse internals changed
+        return die("menu unavailable (could not introspect commands)", EXIT_RUNTIME)
+    cmds = [(ca.dest, ca.help or "") for ca in sub._choices_actions
+            if ca.dest != "menu"]
+    print("lore — pick a command:")
+    for i, (name, help_) in enumerate(cmds, 1):
+        print("  %2d) %-9s %s" % (i, name, help_))
+    sel = _menu_prompt("choice")
+    if not sel:
+        return EXIT_OK
+    name = None
+    if sel.isdigit() and 1 <= int(sel) <= len(cmds):
+        name = cmds[int(sel) - 1][0]
+    elif sel in sub.choices and sel != "menu":
+        name = sel
+    if name is None:
+        return die("not a valid choice: %s" % sel, EXIT_USAGE)
+
+    chosen = sub.choices[name]
+    pos, opt = _menu_command_args(chosen)
+    argv = [name]
+    print("\n%s — %s" % (name, dict(cmds).get(name, "")))
+    for a in pos:
+        val = _menu_prompt("%s (required)" % a.dest)
+        if val:
+            argv.append(val)
+    if opt:
+        print("  options (Enter to skip):")
+        for a in opt:
+            flag = a.option_strings[-1]               # long form
+            if a.nargs == 0:                          # store_true / flag
+                if _menu_prompt("%s? [y/N]" % flag).lower().startswith("y"):
+                    argv.append(flag)
+            else:
+                val = _menu_prompt(flag, choices=list(a.choices) if a.choices else None)
+                if val:
+                    argv.extend([flag, val])
+
+    # Inherit "where's the data / which agent" context from the menu invocation,
+    # so `lore menu --sandboxes-root X` runs the chosen command against X.
+    if getattr(args, "sandboxes_root", None):
+        argv += ["--sandboxes-root", args.sandboxes_root]
+    if getattr(args, "sandy_home", None):
+        argv += ["--sandy-home", args.sandy_home]
+    if getattr(args, "agent", None):
+        argv += ["--agent", ",".join(sorted(args.agent))]
+
+    print("\nrunning: lore %s\n" % " ".join(argv))
+    return main(argv)
+
+
 # ── §12  argparse + main ────────────────────────────────────────────────────
 def build_parser():
     common = argparse.ArgumentParser(add_help=False)
@@ -1588,6 +1679,10 @@ def build_parser():
     p.add_argument("id", help="session id (or prefix), or a title substring")
     p.add_argument("--project")
     p.set_defaults(func=cmd_session)
+
+    p = sub.add_parser("menu", parents=[common],
+                       help="interactive picker: choose a command, get prompted for its options")
+    p.set_defaults(func=cmd_menu)
 
     return parser
 

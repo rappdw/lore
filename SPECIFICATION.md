@@ -93,6 +93,7 @@ Global flags: `--agent A[,B]`, `--source sandbox|host`, `--sandboxes-root <dir>`
 - **`graph`** `[--project P] [--dot] [--cross-project]` — link graph (text tree / graphviz). Marks dangling edges. (Sparse for non-Claude agents.)
 - **`stats`** — **coverage** (sandboxes *enumerated* vs. *with memory*, so a sparse result is legibly "no memory there", not a miss); counts by agent / type / project; index/file mismatches; dangling links; mtime growth. The coverage line is also emitted on stderr under `-v` for any command.
 - **`export`** `[--md | --json] [--agent A] [--project P]` — consolidated digest. `--json` is the stable machine schema (§4).
+- **`menu`** — interactive command picker (discoverability): lists every command, prompts for the chosen command's positionals/options, then dispatches it. Stdlib `input()` only — **not** a full TUI (the rich graph browser stays deferred, ROADMAP). Introspects the argparse model so it never drifts from the real command set; inherits `--sandboxes-root`/`--sandy-home`/`--agent` from its own invocation.
 
 ### 5.2 LLM-powered (opt-in; require an Anthropic credential — see §8)
 - **`summarize`** `[--agent A] [--project P] [--type T] [--model M]` — digest "what's been learned," grouped by theme, flagging contradictions; map-reduced when the selection exceeds a char budget.

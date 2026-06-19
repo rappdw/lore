@@ -35,7 +35,7 @@ Command surface and `export --json` schema frozen under a stability promise (mir
 - **Transcripts / sessions.** ✅ **Deterministic session profiles** (`sessions`/`session`) and ✅ **memory↔session provenance** (`originSessionId` ↔ `session_id`) both shipped in `0.1.0`. Still ahead, in order of value: **LLM "what happened" summaries** (needs aggressive transcript reduction — ~98% of the bytes are tool results), **full-text transcript search**, and `history.jsonl`. Kept a separate surface from memory by design.
 - **Embeddings.** Swap token-overlap for a local/hosted embedding model behind the same dedup/relevance interfaces, *if* heuristics prove insufficient — accepting the dependency/provider cost.
 - **OpenCode plugin memory.** A pluggable sub-adapter for the third-party memory plugins (`opencode-agent-memory`, etc.), once one is common enough to be worth it.
-- **TUI / watch mode.** An interactive browser over the graph, or a `watch` that surfaces relevant prior memories as you start work in a project.
+- **TUI / watch mode.** A lightweight stdlib `input()` command picker (`menu`) shipped in `0.2.0` for discoverability. Still deferred: an interactive (curses) browser over the graph, or a `watch` that surfaces relevant prior memories as you start work in a project.
 - **Its own repository.** ✅ Done — graduated out of `sandy/` into a standalone repo, versioned independently (sandy is a documented dependency via `--print-state`, not a parent).
 - **Promote-to-shared.** A reviewed path for elevating a broadly-true `user`/`feedback` memory into something seeded across new sandboxes — the careful, opt-in inverse of isolation.
 

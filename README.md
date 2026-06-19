@@ -35,6 +35,7 @@ The primary **source** is your **sandy sandboxes** (enumerated via `sandy --prin
 | `export [--json \| --md]` | a consolidated digest | — | — |
 | `sessions [--project P --sort …]` | list session transcripts: title, timing, msg/tool counts, branch | — | — |
 | `session <id\|title>` | full profile of one session: tools, files touched, PRs, errors, opening prompt | — | — |
+| `menu` | interactive picker — choose a command, get prompted for its options, then it runs | — | — |
 | `summarize [--agent A --project P --type T --model M]` | "what have the agents learned?" digest, grouped by theme, map-reduced over a char budget | ✓ | — |
 | `relevant <project> [--top N --explain --model M]` | memories from *other* projects/agents that may apply here; ranked offline, `--explain` adds LLM rationales | ✓ (only `--explain`) | — |
 | `copy <title> --to <project>` | deliberately carry one memory into another sandbox | — | ✓ |
