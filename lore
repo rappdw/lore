@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # ── §2  Constants ───────────────────────────────────────────────────────────
-LORE_VERSION = "0.1.0"
+LORE_VERSION = "0.1.1-dev"
 LORE_COMMIT = ""  # baked at install time by install.sh; empty => "dev"
 DEFAULT_SANDY_HOME = os.path.expanduser("~/.sandy")
 VALID_TYPES = {"user", "feedback", "project", "reference"}
