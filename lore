@@ -1,0 +1,1285 @@
+#!/usr/bin/env python3
+"""lore — one lens over the memory AI coding agents accumulate.
+
+Single-file, standard-library-only. v0a: source enumeration + adapter framework
++ the Claude adapter + read-only commands (ls/search/show/graph/stats/export).
+No LLM, no mutation, no non-Claude adapters (those are later increments).
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+# ── §2  Constants ───────────────────────────────────────────────────────────
+LORE_VERSION = "0.1.0"
+LORE_COMMIT = ""  # baked at install time by install.sh; empty => "dev"
+DEFAULT_SANDY_HOME = os.path.expanduser("~/.sandy")
+VALID_TYPES = {"user", "feedback", "project", "reference"}
+KNOWN_AGENTS = {"claude", "gemini", "codex", "opencode"}
+EXIT_OK, EXIT_RUNTIME, EXIT_USAGE = 0, 1, 2
+
+
+# ── §3  Dataclasses ─────────────────────────────────────────────────────────
+@dataclass
+class MemoryItem:
+    agent: str
+    source: str            # e.g. "sandbox:<name>"
+    source_kind: str       # "auto_memory" | "instructions"
+    project: str           # humanized label (workspace basename / humanized slug)
+    project_slug: str      # the agent's on-disk project dir (uniqueness/link scope)
+    path: str
+    title: str
+    body: str
+    mtime: float
+    description: Optional[str] = None
+    type: Optional[str] = None
+    origin_session_id: Optional[str] = None
+    links: list = field(default_factory=list)
+    in_index: Optional[bool] = None
+    readonly: bool = False
+    parse_warning: Optional[str] = None
+
+    def to_json_dict(self) -> dict:
+        # Fixed key order incl. nulls — the stable `export --json` schema.
+        return collections.OrderedDict([
+            ("agent", self.agent),
+            ("source", self.source),
+            ("source_kind", self.source_kind),
+            ("project", self.project),
+            ("project_slug", self.project_slug),
+            ("path", self.path),
+            ("title", self.title),
+            ("type", self.type),
+            ("description", self.description),
+            ("origin_session_id", self.origin_session_id),
+            ("links", list(self.links)),
+            ("in_index", self.in_index),
+            ("readonly", self.readonly),
+            ("mtime", self.mtime),
+            ("mtime_iso", _iso(self.mtime)),
+            ("parse_warning", self.parse_warning),
+            ("body", self.body),
+        ])
+
+
+@dataclass
+class Source:
+    name: str
+    path: str
+    workspace_path: Optional[str]
+    lock_holder_alive: Optional[bool]
+
+    @property
+    def source_id(self) -> str:
+        return "sandbox:%s" % self.name
+
+    @property
+    def label(self) -> Optional[str]:
+        if self.workspace_path:
+            base = os.path.basename(self.workspace_path.rstrip("/"))
+            return base or self.workspace_path
+        return None
+
+
+@dataclass
+class IndexEntry:
+    title: str
+    slug: str           # normalized basename of the link target (e.g. "alpha.md")
+    hook: Optional[str]
+
+
+@dataclass
+class GraphResult:
+    edges: list         # list of (src_item, link_str, target_item|None, resolved: bool)
+    dangling: list      # list of (src_item, link_str)
+
+
+@dataclass
+class SessionProfile:
+    """Deterministic characterization of one session transcript (a `*.jsonl`)."""
+    source: str
+    project: str
+    project_slug: str
+    session_id: str
+    path: str
+    title: Optional[str]
+    started: Optional[str]
+    ended: Optional[str]
+    n_events: int
+    n_user: int
+    n_assistant: int
+    tools: dict             # tool name -> use count
+    files_touched: list
+    git_branch: Optional[str]
+    model: Optional[str]
+    version: Optional[str]
+    pr_urls: list
+    error_count: int
+    compact_count: int
+    first_prompt: Optional[str]
+    mtime: float
+    parse_warning: Optional[str] = None
+
+    @property
+    def duration_s(self) -> Optional[int]:
+        a, b = _parse_iso(self.started), _parse_iso(self.ended)
+        return int((b - a).total_seconds()) if a and b else None
+
+    def to_json_dict(self) -> dict:
+        return collections.OrderedDict([
+            ("session_id", self.session_id),
+            ("source", self.source),
+            ("project", self.project),
+            ("project_slug", self.project_slug),
+            ("path", self.path),
+            ("title", self.title),
+            ("started", self.started),
+            ("ended", self.ended),
+            ("duration_s", self.duration_s),
+            ("n_events", self.n_events),
+            ("n_user", self.n_user),
+            ("n_assistant", self.n_assistant),
+            ("tools", dict(self.tools)),
+            ("files_touched", list(self.files_touched)),
+            ("git_branch", self.git_branch),
+            ("model", self.model),
+            ("version", self.version),
+            ("pr_urls", list(self.pr_urls)),
+            ("error_count", self.error_count),
+            ("compact_count", self.compact_count),
+            ("first_prompt", self.first_prompt),
+            ("mtime", self.mtime),
+            ("parse_warning", self.parse_warning),
+        ])
+
+
+# ── §4  Pure parsers + helpers (unit-testable in isolation) ─────────────────
+def _unquote(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _first_heading(body: str) -> Optional[str]:
+    for ln in body.split("\n"):
+        m = re.match(r"^#{1,6}\s+(.*\S)\s*$", ln)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _stem(filename: str) -> str:
+    base = os.path.basename(filename)
+    return base[:-3] if base.endswith(".md") else base
+
+
+def _norm_slug(target: str) -> str:
+    return os.path.basename(target.strip())
+
+
+def _iso(mtime) -> Optional[str]:
+    try:
+        return (datetime.datetime.fromtimestamp(float(mtime), datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None
+
+
+def _humanize_slug(slug: str) -> str:
+    # Claude project slug = workspace path with non-alnum -> '-'.
+    # "-home-claude-dev-sandy" -> "sandy" (best-effort display label).
+    parts = [p for p in slug.split("-") if p]
+    return parts[-1] if parts else slug
+
+
+def _parse_iso(s) -> Optional["datetime.datetime"]:
+    # Tolerant: take YYYY-MM-DDTHH:MM:SS, ignore fractional seconds / Z (all UTC).
+    if not s:
+        return None
+    try:
+        return datetime.datetime.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return None
+
+
+def _fmt_duration(seconds) -> str:
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    if seconds < 60:
+        return "%ds" % seconds
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return "%dm" % m
+    h, m = divmod(m, 60)
+    if h < 24:
+        return "%dh%02dm" % (h, m)
+    d, h = divmod(h, 24)
+    return "%dd%02dh" % (d, h)
+
+
+def parse_frontmatter(text: str):
+    """Return (meta: dict, body: str, warning: Optional[str]).
+
+    Tolerant by design — frontmatter shape varies across agents/harness versions,
+    so we EXTRACT the few keys we understand and silently ignore everything else
+    (extra keys, list items, nested maps). Recognized keys, at ANY indent (so
+    `type:` works whether top-level or under a `metadata:` block):
+      name (or title), description, type, originSessionId.
+    No fence -> ({}, text, None). The only warning is a structurally broken
+    (unterminated) fence. Never raises.
+    """
+    s = text.lstrip("﻿")
+    lines = s.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return ({}, text, None)
+    close = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            close = i
+            break
+    if close is None:
+        return ({}, text, "unterminated frontmatter")
+    body = "\n".join(lines[close + 1:]).lstrip("\n")
+    meta = {}
+    for ln in lines[1:close]:
+        m = re.match(r"^\s*([A-Za-z0-9_-]+):\s?(.*)$", ln)
+        if not m:
+            continue  # list items / blank lines / nested junk — silently ignored
+        key, val = m.group(1), _unquote(m.group(2).strip())
+        if not val:
+            continue  # a bare `key:` block marker (e.g. `metadata:`) — nothing to capture
+        if key in ("name", "title"):
+            meta.setdefault("name", val)
+        elif key == "description":
+            meta.setdefault("description", val)
+        elif key == "type":
+            meta.setdefault("type", val)
+        elif key in ("originSessionId", "origin_session_id"):
+            meta.setdefault("originSessionId", val)
+        # any other key is ignored, no warning
+    return (meta, body, None)
+
+
+_INDEX_RE = re.compile(
+    r"^\s*[-*+]\s+\[(?P<title>[^\]]+)\]\((?P<target>[^)]+)\)\s*"
+    r"(?:[—–\-]+\s*(?P<hook>.*\S))?\s*$"
+)
+
+
+def parse_memory_index(text: str):
+    """Parse `- [Title](slug.md) — hook` lines. Non-matching lines ignored. Never raises."""
+    out = []
+    for ln in text.split("\n"):
+        m = _INDEX_RE.match(ln)
+        if not m:
+            continue
+        out.append(IndexEntry(
+            title=m.group("title").strip(),
+            slug=_norm_slug(m.group("target")),
+            hook=(m.group("hook").strip() if m.group("hook") else None),
+        ))
+    return out
+
+
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]|]+?)(?:\|[^\[\]]*)?\]\]")
+
+
+def extract_wikilinks(text: str):
+    """Ordered, de-duped [[slug]] targets (supports [[slug|alias]]). Skips fenced code."""
+    out, seen, in_fence = [], set(), False
+    for ln in text.split("\n"):
+        if ln.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for m in _WIKILINK_RE.finditer(ln):
+            t = m.group(1).strip()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
+
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _listdir(path: str):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def _join_warn(a: Optional[str], b: str) -> str:
+    return b if not a else "%s; %s" % (a, b)
+
+
+# ── §5  Adapter base + registry ─────────────────────────────────────────────
+AGENT_REGISTRY = collections.OrderedDict()
+
+
+def register(cls):
+    inst = cls()
+    AGENT_REGISTRY[inst.agent] = inst
+    return cls
+
+
+class Adapter:
+    agent = ""
+    readonly = False
+
+    def discover(self, source: Source):
+        """Map one agent's on-disk memory under `source` to [MemoryItem].
+
+        MUST NOT raise on layout drift — the worst outcome is a stub item with a
+        parse_warning. Returns [] for an absent/empty store.
+        """
+        return []
+
+
+# ── §6  Claude adapter ──────────────────────────────────────────────────────
+@register
+class ClaudeAdapter(Adapter):
+    agent = "claude"
+    readonly = False
+
+    def discover(self, source: Source):
+        items = []
+        base = os.path.join(source.path, "claude", "projects")
+        if not os.path.isdir(base):
+            return items
+        try:
+            slugs = sorted(os.listdir(base))
+        except OSError:
+            return items
+        for slug in slugs:
+            mem_dir = os.path.join(base, slug, "memory")
+            if os.path.isdir(mem_dir):
+                items += self._load_project(source, slug, mem_dir)
+        return items
+
+    def _project_label(self, source: Source, slug: str) -> str:
+        return source.label or _humanize_slug(slug)
+
+    def _load_project(self, source: Source, slug: str, mem_dir: str):
+        items = []
+        indexed = set()
+        idx_path = os.path.join(mem_dir, "MEMORY.md")
+        if os.path.isfile(idx_path):
+            try:
+                for e in parse_memory_index(_read_text(idx_path)):
+                    indexed.add(e.slug)
+            except Exception:
+                pass
+        try:
+            files = sorted(os.listdir(mem_dir))
+        except OSError:
+            return items
+        label = self._project_label(source, slug)
+        for fn in files:
+            if not fn.endswith(".md") or fn == "MEMORY.md":
+                continue
+            fpath = os.path.join(mem_dir, fn)
+            if not os.path.isfile(fpath):
+                continue
+            items.append(self._load_file(source, slug, label, fn, fpath, indexed))
+        return items
+
+    def _load_file(self, source, slug, label, fn, fpath, indexed):
+        common = dict(
+            agent="claude", source=source.source_id, source_kind="auto_memory",
+            project=label, project_slug=slug, path=fpath,
+            mtime=_safe_mtime(fpath), in_index=(fn in indexed), readonly=False,
+        )
+        try:
+            text = _read_text(fpath)
+        except Exception as e:  # pragma: no cover - defensive
+            return MemoryItem(title=_stem(fn), body="", type="unknown",
+                              parse_warning="unreadable file: %s" % e, **common)
+        meta, body, warning = parse_frontmatter(text)
+        title = meta.get("name") or _first_heading(body) or _stem(fn)
+        mtype = meta.get("type")
+        if mtype is None:
+            mtype = "unknown"
+        elif mtype not in VALID_TYPES:
+            warning = _join_warn(warning, "unknown type: %s" % mtype)
+        return MemoryItem(
+            title=title, body=body, type=mtype,
+            description=meta.get("description"),
+            origin_session_id=meta.get("originSessionId"),
+            links=extract_wikilinks(body), parse_warning=warning, **common)
+
+
+# ── §7  Enumeration ─────────────────────────────────────────────────────────
+def _read_workspace_path(sandbox_dir: str) -> Optional[str]:
+    wp = os.path.join(sandbox_dir, "WORKSPACE.json")
+    if not os.path.isfile(wp):
+        return None
+    try:
+        txt = _read_text(wp)
+    except Exception:
+        return None
+    try:
+        v = json.loads(txt).get("workspace_path")
+        if isinstance(v, str) and v:
+            return v
+    except Exception:
+        pass
+    m = re.search(r'"workspace_path"\s*:\s*"([^"]+)"', txt)  # lenient fallback
+    return m.group(1) if m else None
+
+
+def _sources_from_print_state(args):
+    """Return [Source] from `sandy --print-state`, or None to signal 'fall through'."""
+    try:
+        p = subprocess.run(["sandy", "--print-state"],
+                           capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        data = json.loads(p.stdout)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    sandboxes = data.get("sandboxes")
+    if not isinstance(sandboxes, list):
+        return None
+    out = []
+    for sb in sandboxes:
+        if not isinstance(sb, dict):
+            continue
+        name, path = sb.get("name"), sb.get("path")
+        if not name or not path:
+            continue
+        path = path.rstrip("/")
+        wp = sb.get("workspace_path") or _read_workspace_path(path)  # defensive
+        out.append(Source(name=name, path=path, workspace_path=wp,
+                          lock_holder_alive=sb.get("lock_holder_alive")))
+    return out
+
+
+def _sources_from_walk(root: str):
+    out = []
+    if not os.path.isdir(root):
+        return out
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for name in names:
+        if name.startswith("."):  # skip .<name>.lock mutex dirs
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        out.append(Source(name=name, path=path,
+                          workspace_path=_read_workspace_path(path),
+                          lock_holder_alive=None))
+    return out
+
+
+def discover_sources(args):
+    if args.sandboxes_root:
+        return _sources_from_walk(args.sandboxes_root)
+    srcs = _sources_from_print_state(args)
+    if srcs is not None:
+        return srcs
+    home = args.sandy_home or os.environ.get("SANDY_HOME") or DEFAULT_SANDY_HOME
+    return _sources_from_walk(os.path.join(home, "sandboxes"))
+
+
+# ── §8  Graph ───────────────────────────────────────────────────────────────
+def _item_keys(item: MemoryItem):
+    return {_stem(item.path), item.title, item.title.lower()}
+
+
+def build_graph(items, cross_project: bool) -> GraphResult:
+    if cross_project:
+        scopes = {"__all__": items}
+        def scope_of(it):
+            return "__all__"
+    else:
+        scopes = collections.defaultdict(list)
+        for it in items:
+            scopes[(it.source, it.project_slug)].append(it)
+        def scope_of(it):
+            return (it.source, it.project_slug)
+
+    key_index = {}
+    for sk, its in scopes.items():
+        idx = {}
+        for it in its:
+            for k in _item_keys(it):
+                idx.setdefault(k, it)
+        key_index[sk] = idx
+
+    edges, dangling = [], []
+    for it in items:
+        idx = key_index.get(scope_of(it), {})
+        for ln in it.links:
+            target = idx.get(ln) or idx.get(_stem(ln)) or idx.get(ln.lower())
+            if target is not None and target is not it:
+                edges.append((it, ln, target, True))
+            else:
+                edges.append((it, ln, None, False))
+                dangling.append((it, ln))
+    return GraphResult(edges=edges, dangling=dangling)
+
+
+# ── §9  Collection orchestration ────────────────────────────────────────────
+def collect_items(args):
+    sources = discover_sources(args)
+    items = []
+    for src in sources:
+        for agent, adapter in AGENT_REGISTRY.items():
+            if args.agent and agent not in args.agent:
+                continue
+            try:
+                items += adapter.discover(src)
+            except Exception as e:  # pragma: no cover - adapters shouldn't raise
+                warn("adapter %s failed on %s: %s" % (agent, src.name, e), args, 1)
+    # Coverage (recorded pre-filter): how many sandboxes were enumerated, and how
+    # many actually yielded memory — so an empty/sparse result reads as "no memory
+    # in those sandboxes", not "lore missed something".
+    args._sources_total = len(sources)
+    args._sources_with_memory = len(set(it.source for it in items))
+    if getattr(args, "type", None):
+        items = [it for it in items if it.type == args.type]
+    if getattr(args, "project", None):
+        items = [it for it in items if args.project in (it.project, it.project_slug)]
+    return items
+
+
+def emit_coverage(args):
+    """Under -v, note how many sandboxes were enumerated vs. had memory."""
+    total = getattr(args, "_sources_total", None)
+    if total is None:
+        return
+    warn("enumerated %d sandbox(es); %d with memory (this agent set)"
+         % (total, getattr(args, "_sources_with_memory", 0)), args, 1)
+
+
+# ── §9b  Sessions (transcripts) ─────────────────────────────────────────────
+# Claude session transcripts live as `<sandbox>/claude/projects/<slug>/*.jsonl`,
+# next to the memory/ dir. They are large (tens of MB) and the JSONL schema is
+# undocumented + version-stamped per event, so scan_session() STREAMS the file
+# line-by-line (never loads it whole) and tolerates unknown/garbled events.
+
+def scan_session(path: str, source: Source, slug: str, label: str) -> SessionProfile:
+    sid = os.path.basename(path)
+    if sid.endswith(".jsonl"):
+        sid = sid[:-6]
+    prof = SessionProfile(
+        source=source.source_id, project=label, project_slug=slug, session_id=sid,
+        path=path, title=None, started=None, ended=None, n_events=0, n_user=0,
+        n_assistant=0, tools={}, files_touched=[], git_branch=None, model=None,
+        version=None, pr_urls=[], error_count=0, compact_count=0,
+        first_prompt=None, mtime=_safe_mtime(path),
+    )
+    tools, files_seen = collections.Counter(), set()
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except Exception as e:  # pragma: no cover - defensive
+        prof.parse_warning = "unreadable: %s" % e
+        return prof
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue  # tolerate a truncated / non-JSON line
+            if not isinstance(e, dict):
+                continue
+            prof.n_events += 1
+            t = e.get("type")
+            ts = e.get("timestamp")
+            if ts:
+                if prof.started is None:
+                    prof.started = ts
+                prof.ended = ts
+            if e.get("gitBranch"):
+                prof.git_branch = e["gitBranch"]
+            if e.get("version"):
+                prof.version = e["version"]
+            if e.get("compactMetadata") or e.get("isCompactSummary"):
+                prof.compact_count += 1
+            if e.get("isApiErrorMessage") or e.get("apiErrorStatus"):
+                prof.error_count += 1
+            if t == "user":
+                prof.n_user += 1
+                if prof.first_prompt is None:
+                    msg = e.get("message")
+                    c = msg.get("content") if isinstance(msg, dict) else None
+                    if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
+                        prof.first_prompt = " ".join(c.split())[:200]
+            elif t == "assistant":
+                prof.n_assistant += 1
+                msg = e.get("message")
+                if isinstance(msg, dict):
+                    if prof.model is None and msg.get("model"):
+                        prof.model = msg["model"]
+                    c = msg.get("content")
+                    if isinstance(c, list):
+                        for b in c:
+                            if isinstance(b, dict) and b.get("type") == "tool_use":
+                                if b.get("name"):
+                                    tools[b["name"]] += 1
+                                inp = b.get("input")
+                                if isinstance(inp, dict):
+                                    fp = inp.get("file_path") or inp.get("path")
+                                    if isinstance(fp, str) and fp not in files_seen:
+                                        files_seen.add(fp)
+                                        prof.files_touched.append(fp)
+            elif t == "ai-title":
+                prof.title = e.get("aiTitle") or prof.title
+            elif t == "pr-link":
+                u = e.get("prUrl")
+                if u and u not in prof.pr_urls:
+                    prof.pr_urls.append(u)
+    prof.tools = dict(tools)
+    if not prof.title:
+        prof.title = prof.first_prompt or sid[:12]
+    return prof
+
+
+def discover_sessions(args):
+    sources = discover_sources(args)
+    args._sessions_sources = len(sources)
+    # Transcripts are Claude-specific in this increment.
+    if args.agent and "claude" not in args.agent:
+        return []
+    out = []
+    for src in sources:
+        base = os.path.join(src.path, "claude", "projects")
+        if not os.path.isdir(base):
+            continue
+        try:
+            slugs = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for slug in slugs:
+            pdir = os.path.join(base, slug)
+            if not os.path.isdir(pdir):
+                continue
+            try:
+                names = sorted(os.listdir(pdir))
+            except OSError:
+                continue
+            label = src.label or _humanize_slug(slug)
+            for fn in names:
+                if fn.endswith(".jsonl") and os.path.isfile(os.path.join(pdir, fn)):
+                    out.append(scan_session(os.path.join(pdir, fn), src, slug, label))
+    if getattr(args, "project", None):
+        out = [s for s in out if args.project in (s.project, s.project_slug)]
+    return out
+
+
+def claude_index_mismatches(items):
+    """(file_without_index_items, index_without_file_tuples). Re-reads MEMORY.md."""
+    fwi = [it for it in items if it.in_index is False]
+    seen = collections.defaultdict(set)
+    dirs = {}
+    for it in items:
+        key = (it.source, it.project_slug)
+        seen[key].add(os.path.basename(it.path))
+        dirs[key] = os.path.dirname(it.path)
+    iwf = []
+    for key, mem_dir in dirs.items():
+        idx_path = os.path.join(mem_dir, "MEMORY.md")
+        if not os.path.isfile(idx_path):
+            continue
+        try:
+            for e in parse_memory_index(_read_text(idx_path)):
+                if e.slug not in seen[key]:
+                    iwf.append((key[0], key[1], e.slug))
+        except Exception:
+            pass
+    return fwi, iwf
+
+
+# ── §9c  Provenance (memory ↔ session) ──────────────────────────────────────
+# Memories carry `originSessionId` in frontmatter; transcripts are named
+# `<session_id>.jsonl`. The two match exactly, so we can bridge a memory to the
+# session that produced it (and flag sessions that produced none).
+
+def session_id_paths(args):
+    """Map session_id -> (transcript path, slug) by listing *.jsonl (NO content scan).
+
+    Cheap: used for provenance counts/lookups without scanning the (huge)
+    transcript bodies.
+    """
+    out = {}
+    if args.agent and "claude" not in args.agent:
+        return out
+    for src in discover_sources(args):
+        base = os.path.join(src.path, "claude", "projects")
+        for slug in _listdir(base):
+            pdir = os.path.join(base, slug)
+            if not os.path.isdir(pdir):
+                continue
+            for fn in _listdir(pdir):
+                if fn.endswith(".jsonl"):
+                    out[fn[:-6]] = (os.path.join(pdir, fn), slug)
+    return out
+
+
+def resolve_origin_session(item, args):
+    """Scan the single transcript that produced `item` (its originSessionId), or None."""
+    if not item.origin_session_id:
+        return None
+    hit = session_id_paths(args).get(item.origin_session_id)
+    if not hit:
+        return None
+    path, slug = hit
+    sandbox_name = item.source.split("sandbox:", 1)[-1]
+    src = Source(name=sandbox_name, path="", workspace_path=None, lock_holder_alive=None)
+    return scan_session(path, src, slug, item.project)
+
+
+# ── §11  Output helpers ─────────────────────────────────────────────────────
+def emit_json(obj):
+    sys.stdout.write(json.dumps(obj, indent=2) + "\n")
+
+
+def die(msg: str, code: int = EXIT_RUNTIME, as_json: bool = False) -> int:
+    if as_json:
+        sys.stderr.write(json.dumps({"error": msg}) + "\n")
+    else:
+        sys.stderr.write("lore: %s\n" % msg)
+    return code
+
+
+def warn(msg: str, args, level: int = 1):
+    if getattr(args, "verbosity", 0) >= level:
+        sys.stderr.write("lore: %s\n" % msg)
+
+
+def _ls_sorted(items, key):
+    if key == "mtime":
+        return sorted(items, key=lambda it: it.mtime, reverse=True)
+    return sorted(items, key=lambda it: it.title.lower())  # name (default): A–Z by title
+
+
+def _fmt_counter(c):
+    return ", ".join("%s=%d" % (k, c[k]) for k in sorted(c)) or "(none)"
+
+
+# ── §10  Commands ───────────────────────────────────────────────────────────
+def cmd_ls(args):
+    items = collect_items(args)
+    if args.json:
+        items = sorted(items, key=lambda it: (it.project, it.agent, it.title.lower()))
+        emit_json({"items": [it.to_json_dict() for it in items], "count": len(items)})
+        return EXIT_OK
+    if not items:
+        print("No memories found.")
+        return EXIT_OK
+    # project (A–Z) -> agent (A–Z) -> one flat A–Z list, with [type] shown inline.
+    groups = collections.OrderedDict()
+    for it in items:
+        groups.setdefault(it.project, collections.OrderedDict()).setdefault(it.agent, []).append(it)
+    for project in sorted(groups):
+        print(project)
+        for agent in sorted(groups[project]):
+            its = _ls_sorted(groups[project][agent], args.sort)
+            maxw = max((len(it.title) for it in its), default=0)
+            print("  [%s]" % agent)
+            for it in its:
+                tag = "[%s]" % (it.type or "unknown")
+                flag = " ⚠" if it.parse_warning else ""
+                print("    • %s  %-11s  %s%s" % (it.title.ljust(maxw), tag, _iso(it.mtime) or "?", flag))
+    return EXIT_OK
+
+
+def _snippet(text, q):
+    i = text.lower().find(q)
+    if i < 0:
+        return None
+    start, end = max(0, i - 30), min(len(text), i + len(q) + 30)
+    s = text[start:end].replace("\n", " ").strip()
+    return ("…" if start > 0 else "") + s + ("…" if end < len(text) else "")
+
+
+def _score(it, q, field):
+    score, snippet = 0, None
+    fields = []
+    if field in ("title", "all"):
+        fields.append((it.title, 3))
+    if field in ("description", "all") and it.description:
+        fields.append((it.description, 2))
+    if field in ("body", "all"):
+        fields.append((it.body, 1))
+    for text, weight in fields:
+        if not text:
+            continue
+        c = text.lower().count(q)
+        if c:
+            score += c * weight
+            if snippet is None:
+                snippet = _snippet(text, q)
+    return score, snippet
+
+
+def cmd_search(args):
+    items = collect_items(args)
+    q = args.query.lower()
+    results = []
+    for it in items:
+        score, snippet = _score(it, q, args.field)
+        if score > 0:
+            results.append((score, it, snippet))
+    results.sort(key=lambda r: (-r[0], -r[1].mtime, r[1].title.lower()))
+    if args.json:
+        emit_json({"items": [dict(it.to_json_dict(), score=score) for score, it, _ in results],
+                   "count": len(results)})
+        return EXIT_OK
+    if not results:
+        print("No matches.")
+        return EXIT_OK
+    for score, it, snippet in results:
+        print("• %s  [%s/%s]" % (it.title, it.project, it.agent))
+        if snippet:
+            print("    %s" % snippet)
+    return EXIT_OK
+
+
+def _neighbors(item, graph, depth):
+    adj = collections.defaultdict(list)
+    for src, ln, target, resolved in graph.edges:
+        if resolved:
+            adj[id(src)].append(target)
+    seen, frontier, out = {id(item)}, [item], []
+    for _ in range(max(0, depth)):
+        nxt = []
+        for node in frontier:
+            for t in adj.get(id(node), []):
+                if id(t) not in seen:
+                    seen.add(id(t))
+                    out.append(t)
+                    nxt.append(t)
+        frontier = nxt
+    return out
+
+
+def cmd_show(args):
+    items = collect_items(args)
+    tl = args.title.lower()
+    matches = [it for it in items
+               if it.title.lower() == tl or _stem(it.path).lower() == tl]
+    if args.project:
+        matches = [it for it in matches if args.project in (it.project, it.project_slug)]
+    if not matches:
+        return die("no memory titled '%s'" % args.title, EXIT_RUNTIME, args.json)
+    if len(matches) > 1:
+        if args.json:
+            sys.stderr.write(json.dumps({"error": "ambiguous title", "matches": [
+                {"project": it.project, "source": it.source, "path": it.path} for it in matches]}) + "\n")
+        else:
+            sys.stderr.write("lore: ambiguous title '%s' — %d matches:\n" % (args.title, len(matches)))
+            for it in matches:
+                sys.stderr.write("  %s / %s  (%s)\n" % (it.project, it.source, it.path))
+            sys.stderr.write("  narrow with --project\n")
+        return EXIT_RUNTIME
+    it = matches[0]
+    graph = build_graph(items, False)
+    out_edges = [e for e in graph.edges if e[0] is it]
+    origin = resolve_origin_session(it, args)
+    if args.json:
+        emit_json({"item": it.to_json_dict(),
+                   "origin_session": origin.to_json_dict() if origin else None,
+                   "neighbors": [n.to_json_dict() for n in _neighbors(it, graph, args.depth)]})
+        return EXIT_OK
+    print("# %s" % it.title)
+    print("agent: %s   project: %s   source: %s" % (it.agent, it.project, it.source))
+    if it.type:
+        print("type: %s" % it.type)
+    if it.description:
+        print("description: %s" % it.description)
+    if origin is not None:
+        print("origin session: %s  (%s, %s)  [%s]"
+              % (origin.title, (origin.started or "?")[:10],
+                 _fmt_duration(origin.duration_s), origin.session_id[:12]))
+    elif it.origin_session_id:
+        print("origin session: %s (transcript not found)" % it.origin_session_id)
+    if it.parse_warning:
+        print("⚠ %s" % it.parse_warning)
+    print()
+    print(it.body.rstrip())
+    print()
+    print("Links:")
+    if not out_edges:
+        print("  (none)")
+    for src, ln, target, resolved in out_edges:
+        print("  → %s" % (target.title if resolved else "%s (dangling)" % ln))
+    return EXIT_OK
+
+
+def _dot_id(s):
+    return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def cmd_graph(args):
+    items = collect_items(args)
+    graph = build_graph(items, args.cross_project)
+    if args.json:
+        emit_json({
+            "nodes": [it.to_json_dict() for it in items],
+            "edges": [{"from": src.title, "from_path": src.path,
+                       "to": (target.title if resolved else ln), "resolved": resolved}
+                      for src, ln, target, resolved in graph.edges],
+        })
+        return EXIT_OK
+    if args.dot:
+        print("digraph lore {")
+        print("  rankdir=LR;")
+        for src, ln, target, resolved in graph.edges:
+            if resolved:
+                print("  %s -> %s;" % (_dot_id(src.title), _dot_id(target.title)))
+            else:
+                print("  %s -> %s [style=dashed,color=red];" % (_dot_id(src.title), _dot_id(ln)))
+        print("}")
+        return EXIT_OK
+    if not items:
+        print("No memories found.")
+        return EXIT_OK
+    by_proj = collections.OrderedDict()
+    for it in items:
+        by_proj.setdefault(it.project, []).append(it)
+    for project, its in by_proj.items():
+        print(project)
+        for it in its:
+            print("  %s" % it.title)
+            for src, ln, target, resolved in [e for e in graph.edges if e[0] is it]:
+                print("    → %s" % (target.title if resolved else "%s (dangling)" % ln))
+    return EXIT_OK
+
+
+def cmd_stats(args):
+    items = collect_items(args)
+    sources = set(it.source for it in items)
+    by_agent = collections.Counter(it.agent for it in items)
+    by_type = collections.Counter(it.type or "unknown" for it in items)
+    by_proj = collections.Counter(it.project for it in items)
+    fwi, iwf = claude_index_mismatches(items)
+    dangling = build_graph(items, False).dangling
+    mtimes = [it.mtime for it in items]
+    oldest = min(mtimes) if mtimes else None
+    newest = max(mtimes) if mtimes else None
+    # provenance (cheap: lists session-id filenames, no transcript scan)
+    sids = set(session_id_paths(args).keys())
+    origins = set(it.origin_session_id for it in items if it.origin_session_id)
+    prov_with = len(sids & origins)
+    mem_with_origin = sum(1 for it in items if it.origin_session_id in sids)
+    if args.json:
+        emit_json({
+            "total": len(items),
+            "sandboxes_enumerated": args._sources_total,
+            "sandboxes_with_memory": args._sources_with_memory,
+            "sources": len(sources),
+            "agents": dict(by_agent),
+            "types": dict(by_type),
+            "projects": dict(by_proj),
+            "mismatches": {
+                "file_without_index": [it.path for it in fwi],
+                "index_without_file": [{"source": s, "project_slug": ps, "slug": sl} for s, ps, sl in iwf],
+            },
+            "dangling": [{"from": src.title, "to": ln} for src, ln in dangling],
+            "provenance": {
+                "sessions_total": len(sids),
+                "sessions_with_memory": prov_with,
+                "sessions_without_memory": len(sids) - prov_with,
+                "memories_with_origin": mem_with_origin,
+                "memories_without_origin": len(items) - mem_with_origin,
+            },
+            "mtime": {"oldest": _iso(oldest), "newest": _iso(newest)},
+        })
+        return EXIT_OK
+    print("sandboxes: %d enumerated, %d with memory   memories: %d"
+          % (args._sources_total, args._sources_with_memory, len(items)))
+    print("by agent:   %s" % _fmt_counter(by_agent))
+    print("by type:    %s" % _fmt_counter(by_type))
+    print("by project: %s" % _fmt_counter(by_proj))
+    print("index mismatches: %d file(s) not in MEMORY.md, %d index entr(ies) with no file"
+          % (len(fwi), len(iwf)))
+    for it in fwi:
+        print("  (no index) %s" % it.path)
+    for s, ps, sl in iwf:
+        print("  (no file)  %s :: %s" % (ps, sl))
+    print("dangling links: %d" % len(dangling))
+    for src, ln in dangling:
+        print("  %s → %s" % (src.title, ln))
+    print("provenance: %d session(s) — %d produced memory, %d produced none; %d/%d memories have a known origin session"
+          % (len(sids), prov_with, len(sids) - prov_with, mem_with_origin, len(items)))
+    if oldest is not None:
+        print("mtime range: %s … %s" % (_iso(oldest), _iso(newest)))
+    return EXIT_OK
+
+
+def cmd_export(args):
+    items = collect_items(args)
+    if args.json:
+        emit_json({"items": [it.to_json_dict() for it in items], "count": len(items)})
+        return EXIT_OK
+    by_proj = collections.OrderedDict()
+    for it in sorted(items, key=lambda i: (i.project, i.agent, i.title.lower())):
+        by_proj.setdefault(it.project, []).append(it)
+    out = ["# lore export"]
+    for project, its in by_proj.items():
+        out.append("\n## %s\n" % project)
+        for it in its:
+            out.append("### %s  [%s/%s]" % (it.title, it.agent, it.type or "unknown"))
+            if it.description:
+                out.append("_%s_" % it.description)
+            out.append("")
+            out.append(it.body.rstrip())
+            out.append("")
+    sys.stdout.write("\n".join(out) + "\n")
+    return EXIT_OK
+
+
+def _top_tools(tools, n=4):
+    return " ".join("%s×%d" % (k, v) for k, v in
+                    sorted(tools.items(), key=lambda kv: -kv[1])[:n]) or "no tools"
+
+
+def cmd_sessions(args):
+    sessions = discover_sessions(args)
+    # provenance: how many memories each session produced (memory load is cheap).
+    produced = collections.Counter(
+        it.origin_session_id for it in collect_items(args) if it.origin_session_id)
+    if args.json:
+        emit_json({"sessions": [dict(s.to_json_dict(),
+                                     produced_memory_count=produced.get(s.session_id, 0))
+                                for s in sessions], "count": len(sessions)})
+        return EXIT_OK
+    if not sessions:
+        print("No sessions found.")
+        return EXIT_OK
+
+    def _ordered(sess):
+        if args.sort == "duration":
+            return sorted(sess, key=lambda s: (s.duration_s or 0), reverse=True)
+        if args.sort == "events":
+            return sorted(sess, key=lambda s: s.n_events, reverse=True)
+        if args.sort == "started":
+            return sorted(sess, key=lambda s: (s.started or ""))
+        return sorted(sess, key=lambda s: (s.title or "").lower())  # title (default): A–Z
+
+    by_proj = collections.OrderedDict()
+    for s in sessions:
+        by_proj.setdefault(s.project, []).append(s)
+    for project in sorted(by_proj):          # projects A–Z
+        print(project)
+        for s in _ordered(by_proj[project]):
+            flag = " ⚠" if s.parse_warning else ""
+            branch = " [%s]" % s.git_branch if s.git_branch else ""
+            mem = " → %d mem" % produced.get(s.session_id, 0)
+            print("  • %s  %s  %s  (msgs %d/%d · %s)%s%s%s"
+                  % (s.title, (s.started or "?")[:10], _fmt_duration(s.duration_s),
+                     s.n_user, s.n_assistant, _top_tools(s.tools), branch, mem, flag))
+    warn("scanned %d session(s) across %d sandbox(es)"
+         % (len(sessions), getattr(args, "_sessions_sources", 0)), args, 1)
+    return EXIT_OK
+
+
+def cmd_session(args):
+    sessions = discover_sessions(args)
+    q = args.id
+    matches = [s for s in sessions if s.session_id == q]
+    if not matches:
+        matches = [s for s in sessions if s.session_id.startswith(q)]
+    if not matches and len(q) >= 3:
+        matches = [s for s in sessions if s.title and q.lower() in s.title.lower()]
+    if not matches:
+        return die("no session matching '%s'" % q, EXIT_RUNTIME, args.json)
+    if len(matches) > 1:
+        if args.json:
+            sys.stderr.write(json.dumps({"error": "ambiguous session", "matches": [
+                {"session_id": s.session_id, "project": s.project, "title": s.title}
+                for s in matches]}) + "\n")
+        else:
+            sys.stderr.write("lore: ambiguous '%s' — %d sessions:\n" % (q, len(matches)))
+            for s in matches:
+                sys.stderr.write("  %s  %s  (%s)\n" % (s.session_id[:12], s.project, s.title))
+            sys.stderr.write("  use a longer id prefix\n")
+        return EXIT_RUNTIME
+    s = matches[0]
+    produced = sorted((it for it in collect_items(args) if it.origin_session_id == s.session_id),
+                      key=lambda it: it.title.lower())
+    if args.json:
+        d = dict(s.to_json_dict())
+        d["produced_memories"] = [{"title": it.title, "project": it.project, "type": it.type}
+                                  for it in produced]
+        emit_json(d)
+        return EXIT_OK
+    print("# %s" % (s.title or s.session_id))
+    print("session: %s" % s.session_id)
+    print("project: %s   source: %s" % (s.project, s.source))
+    print("when:    %s → %s  (%s)" % (s.started or "?", s.ended or "?", _fmt_duration(s.duration_s)))
+    ctx = []
+    if s.git_branch:
+        ctx.append("branch %s" % s.git_branch)
+    if s.model:
+        ctx.append("model %s" % s.model)
+    if s.version:
+        ctx.append("cc %s" % s.version)
+    if ctx:
+        print("context: %s" % ", ".join(ctx))
+    print("activity: %d events  (%d user / %d assistant)" % (s.n_events, s.n_user, s.n_assistant))
+    if s.compact_count:
+        print("compactions: %d" % s.compact_count)
+    if s.error_count:
+        print("api errors: %d" % s.error_count)
+    if s.tools:
+        print("tools: %s" % _top_tools(s.tools, 99))
+    if s.pr_urls:
+        print("PRs:")
+        for u in s.pr_urls:
+            print("  %s" % u)
+    if s.files_touched:
+        print("files touched (%d):" % len(s.files_touched))
+        for fp in s.files_touched[:40]:
+            print("  %s" % fp)
+        if len(s.files_touched) > 40:
+            print("  … and %d more" % (len(s.files_touched) - 40))
+    if s.first_prompt:
+        print("opening prompt: %s" % s.first_prompt)
+    if produced:
+        print("produced memories (%d):" % len(produced))
+        for it in produced:
+            print("  • %s  [%s/%s]" % (it.title, it.project, it.type or "unknown"))
+    else:
+        print("produced memories: none")
+    if s.parse_warning:
+        print("⚠ %s" % s.parse_warning)
+    return EXIT_OK
+
+
+# ── §12  argparse + main ────────────────────────────────────────────────────
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--agent", help="restrict to agent(s), comma-separated")
+    common.add_argument("--source", choices=["sandbox", "host"], default="sandbox")
+    common.add_argument("--sandboxes-root", dest="sandboxes_root",
+                        help="override sandbox discovery (tests / non-default SANDY_HOME)")
+    common.add_argument("--sandy-home", dest="sandy_home")
+    common.add_argument("--include-instructions", dest="include_instructions",
+                        action="store_true", help="(v0b — currently a no-op)")
+    common.add_argument("--json", action="store_true")
+    common.add_argument("-v", dest="v", action="count", default=0)
+    common.add_argument("-q", dest="q", action="count", default=0)
+
+    parser = argparse.ArgumentParser(prog="lore", description="One lens over agent memory.")
+    parser.add_argument("--version", action="version",
+                        version="lore %s (%s)" % (LORE_VERSION, LORE_COMMIT or "dev"))
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("ls", parents=[common], aliases=["list"], help="list memories")
+    p.add_argument("--type")
+    p.add_argument("--project")
+    p.add_argument("--sort", choices=["name", "mtime"], default="name",
+                   help="within each project: name = A–Z by title (default), mtime = newest first")
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("search", parents=[common], help="search memories")
+    p.add_argument("query")
+    p.add_argument("--type")
+    p.add_argument("--project")
+    p.add_argument("--field", choices=["title", "description", "body", "all"], default="all")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("show", parents=[common], help="show a memory + its links")
+    p.add_argument("title")
+    p.add_argument("--project")
+    p.add_argument("--depth", type=int, default=1)
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("graph", parents=[common], help="render the link graph")
+    p.add_argument("--project")
+    p.add_argument("--dot", action="store_true")
+    p.add_argument("--cross-project", dest="cross_project", action="store_true")
+    p.set_defaults(func=cmd_graph)
+
+    p = sub.add_parser("stats", parents=[common], help="counts, mismatches, dangling links")
+    p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("export", parents=[common], help="consolidated digest")
+    p.add_argument("--md", action="store_true", help="markdown (default)")
+    p.add_argument("--project")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("sessions", parents=[common], help="list session profiles (transcripts)")
+    p.add_argument("--project")
+    p.add_argument("--sort", choices=["title", "started", "duration", "events"], default="title",
+                   help="within each project: title = A–Z (default), started/duration/events otherwise")
+    p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("session", parents=[common], help="characterize one session (id prefix or title)")
+    p.add_argument("id", help="session id (or prefix), or a title substring")
+    p.add_argument("--project")
+    p.set_defaults(func=cmd_session)
+
+    return parser
+
+
+def main(argv) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return EXIT_USAGE
+    args.verbosity = getattr(args, "v", 0) - getattr(args, "q", 0)
+
+    if args.agent:
+        agents = set(a.strip() for a in args.agent.split(",") if a.strip())
+        bad = agents - KNOWN_AGENTS
+        if bad:
+            return die("unknown agent(s): %s (known: %s)"
+                       % (", ".join(sorted(bad)), ", ".join(sorted(KNOWN_AGENTS))),
+                       EXIT_USAGE, args.json)
+        args.agent = agents
+    else:
+        args.agent = None
+
+    if args.source == "host":
+        return die("--source host is not implemented in v0", EXIT_RUNTIME, args.json)
+    if getattr(args, "include_instructions", False):
+        warn("--include-instructions is not implemented until v0b (ignored)", args, 1)
+
+    try:
+        code = args.func(args)
+        emit_coverage(args)  # -v note on stderr; harmless for --json (stdout-only)
+        return code
+    except BrokenPipeError:
+        return EXIT_OK
+    except Exception as e:  # pragma: no cover - last-resort guard
+        if args.verbosity >= 1:
+            raise
+        return die(str(e), EXIT_RUNTIME, args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
