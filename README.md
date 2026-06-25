@@ -28,7 +28,7 @@ The primary **source** is your **sandy sandboxes** (enumerated via `sandy --prin
 | Command | Does | Uses LLM | Mutates |
 |---|---|:--:|:--:|
 | `ls` / `list [--type --project --sort]` | memories per project, flat **A–Z by title** (type shown inline) | — | — |
-| `search <query>` | match title / description / body across all sources | — | — |
+| `search <query> [--memories-only \| --sessions-only] [--all]` | match across memories **and** session transcripts (conversation text; `--all` adds tool I/O) | — | — |
 | `show <title>` | a memory plus its `[[link]]` neighborhood | — | — |
 | `graph [--dot]` | the wikilink graph (sparse for non-Claude agents) | — | — |
 | `stats` | counts by agent/type/project, growth, orphan & dangling links | — | — |

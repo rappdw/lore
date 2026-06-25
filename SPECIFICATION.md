@@ -88,7 +88,7 @@ Global flags: `--agent A[,B]`, `--source sandbox|host`, `--sandboxes-root <dir>`
 
 ### 5.1 Read-only (offline, no LLM)
 - **`ls` / `list`** `[--agent A] [--type T] [--project P] [--sort name|mtime]` — projects **A–Z**, then a **flat A–Z-by-title** list per project with the `type` shown inline (`name` is the default; `mtime` = newest first).
-- **`search <query>`** `[--agent A] [--field title|description|body|all]` — ranked substring/token match.
+- **`search <query>`** `[--agent A] [--type T] [--project P] [--field title|description|body|all] [--memories-only | --sessions-only] [--all]` — ranked match over **memories AND session transcripts** by default. `--memories-only` (offline, skips transcripts) / `--sessions-only` scope it. In transcripts it matches **conversation text** (user prompts + assistant text); `--all` also scans tool inputs/results. Transcript scan is Claude-only, streaming, gated by a cheap raw-substring pre-filter; sessions keep their own model (`SessionProfile`), not folded into the memory view.
 - **`show <title>`** `[--project P] [--depth N]` — a memory + its link neighborhood.
 - **`graph`** `[--project P] [--dot] [--cross-project]` — link graph (text tree / graphviz). Marks dangling edges. (Sparse for non-Claude agents.)
 - **`stats`** — **coverage** (sandboxes *enumerated* vs. *with memory*, so a sparse result is legibly "no memory there", not a miss); counts by agent / type / project; index/file mismatches; dangling links; mtime growth. The coverage line is also emitted on stderr under `-v` for any command.
@@ -198,7 +198,7 @@ Model honors `--model`/`SANDY_MODEL`, default `claude-opus-4-8`. Prompts use `ti
 
 ## 10. Non-goals (v0)
 
-- **Deterministic session profiles are now IN** (§5b). Still out: **memory↔session provenance** (`originSessionId` ↔ `session_id`), **LLM "what happened" summaries** (needs aggressive transcript reduction first), **full-text transcript search**, and **`history.jsonl`**.
+- **Deterministic session profiles are now IN** (§5b). Still out: **memory↔session provenance** (`originSessionId` ↔ `session_id`), **LLM "what happened" summaries** (needs aggressive transcript reduction first) and **`history.jsonl`**. (Full-text transcript search is now IN — folded into `search`, §5.1.)
 - **Embeddings** — v0 uses token-overlap + opt-in LLM; revisit only if heuristics prove weak (accepts a dependency/provider cost).
 - **OpenCode plugin memory & writing Codex memory** — out by rule (no core feature / generated-state).
 - **Authoring new memories** except via explicit `copy`/`merge`.

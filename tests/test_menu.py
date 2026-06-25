@@ -45,8 +45,9 @@ class TestMenu(unittest.TestCase):
         self.assertIn("zork", out)               # ls ran against the fixture
 
     def test_positional_and_choice_option(self):
-        # search <query>, skip --type/--project, pick --field title.
-        code, out, _ = self._menu(["search", "alpha", "", "", "title"])
+        # search <query>=alpha; opts in order: --type, --project, --field (title),
+        # --memories-only, --sessions-only, --all (skip the flags).
+        code, out, _ = self._menu(["search", "alpha", "", "", "title", "", "", ""])
         self.assertEqual(code, 0)
         self.assertIn("running: lore search alpha --field title", out)
         self.assertIn("alpha", out)

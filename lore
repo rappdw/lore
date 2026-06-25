@@ -713,6 +713,118 @@ def discover_sessions(args):
     return out
 
 
+def _iter_transcripts(args):
+    """Yield (path, src, slug, label) for each `<sandbox>/claude/projects/<slug>/*.jsonl`.
+    Claude-only; honors `--project`. Enumeration only — no content read."""
+    if args.agent and "claude" not in args.agent:
+        return
+    proj = getattr(args, "project", None)
+    for src in discover_sources(args):
+        base = os.path.join(src.path, "claude", "projects")
+        for slug in _listdir(base):
+            pdir = os.path.join(base, slug)
+            if not os.path.isdir(pdir):
+                continue
+            label = src.label or _humanize_slug(slug)
+            if proj and proj not in (label, slug):
+                continue
+            for fn in _listdir(pdir):
+                if fn.endswith(".jsonl") and os.path.isfile(os.path.join(pdir, fn)):
+                    yield os.path.join(pdir, fn), src, slug, label
+
+
+def _file_has_substring(path, ql) -> bool:
+    """Cheap raw streaming gate — lowercase substring scan, no JSON parse. Lets a
+    non-matching transcript skip the full parse entirely. Tolerant of read errors."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if ql in line.lower():
+                    return True
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return False
+
+
+def _toolresult_text(content) -> str:
+    """Flatten a tool_result `content` (str, or list of {type:text,text}) to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def search_session(path, ql, include_all):
+    """One streaming parse pass over a transcript; returns (title, started, hits).
+    Conversation text always (user prompts + assistant text); tool inputs/results
+    only when `include_all`. Each hit: {role, source, timestamp, snippet}. Mirrors
+    scan_session's tolerance (skips bad lines, never hard-fails)."""
+    sid = os.path.basename(path)
+    if sid.endswith(".jsonl"):
+        sid = sid[:-6]
+    title, first_user, started, hits = None, None, None, []
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except Exception:  # pragma: no cover - defensive
+        return sid[:12], None, hits
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(e, dict):
+                continue
+            ts = e.get("timestamp")
+            if ts and started is None:
+                started = ts
+            t = e.get("type")
+            if t == "ai-title":
+                title = e.get("aiTitle") or title
+                continue
+            if t not in ("user", "assistant"):
+                continue
+            msg = e.get("message")
+            c = msg.get("content") if isinstance(msg, dict) else None
+            texts = []  # (source, role, text)
+            if t == "user":
+                if isinstance(c, str):
+                    texts.append(("prompt", "user", c))
+                elif isinstance(c, list):
+                    for b in c:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text":
+                            texts.append(("prompt", "user", b.get("text", "")))
+                        elif include_all and b.get("type") == "tool_result":
+                            texts.append(("tool_result", "user", _toolresult_text(b.get("content"))))
+            else:  # assistant
+                if isinstance(c, list):
+                    for b in c:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text":
+                            texts.append(("response", "assistant", b.get("text", "")))
+                        elif include_all and b.get("type") == "tool_use":
+                            texts.append(("tool_input", "assistant",
+                                          json.dumps(b.get("input", {}), ensure_ascii=False)))
+            for source, role, txt in texts:
+                if (source == "prompt" and first_user is None and txt.strip()
+                        and not txt.lstrip().startswith("<")):
+                    first_user = " ".join(txt.split())[:60]
+                if txt and ql in txt.lower():
+                    hits.append({"role": role, "source": source,
+                                 "timestamp": ts, "snippet": _snippet(txt, ql)})
+    if not title:
+        title = first_user or sid[:12]
+    return title, started, hits
+
+
 def claude_index_mismatches(items):
     """(file_without_index_items, index_without_file_tuples). Re-reads MEMORY.md."""
     fwi = [it for it in items if it.in_index is False]
@@ -859,26 +971,68 @@ def _score(it, q, field):
     return score, snippet
 
 
+SESSION_SEARCH_SHOW = 5     # session hits shown per session in text output
+
+
 def cmd_search(args):
-    items = collect_items(args)
+    if args.memories_only and args.sessions_only:
+        return die("--memories-only and --sessions-only are mutually exclusive",
+                   EXIT_USAGE, args.json)
     q = args.query.lower()
-    results = []
-    for it in items:
-        score, snippet = _score(it, q, args.field)
-        if score > 0:
-            results.append((score, it, snippet))
-    results.sort(key=lambda r: (-r[0], -r[1].mtime, r[1].title.lower()))
+    want_mem = not args.sessions_only
+    want_sess = not args.memories_only
+
+    mem = []
+    if want_mem:
+        for it in collect_items(args):
+            score, snippet = _score(it, q, args.field)
+            if score > 0:
+                mem.append((score, it, snippet))
+        mem.sort(key=lambda r: (-r[0], -r[1].mtime, r[1].title.lower()))
+
+    sess = []   # (session_id, title, project, slug, path, started, hits)
+    if want_sess:
+        for path, src, slug, label in _iter_transcripts(args):
+            if not _file_has_substring(path, q):
+                continue
+            title, started, hits = search_session(path, q, args.all)
+            if hits:
+                sid = os.path.basename(path)[:-6]
+                sess.append((sid, title, label, slug, path, started, hits))
+        sess.sort(key=lambda r: (-len(r[6]), -(_safe_mtime(r[4])), (r[1] or "").lower()))
+
     if args.json:
-        emit_json({"items": [dict(it.to_json_dict(), score=score) for score, it, _ in results],
-                   "count": len(results)})
+        emit_json({
+            "query": args.query,
+            "items": [dict(it.to_json_dict(), score=score, snippet=snip)
+                      for score, it, snip in mem],
+            "sessions": [{"session_id": sid, "title": title, "project": label,
+                          "project_slug": slug, "path": path,
+                          "hit_count": len(hits), "hits": hits}
+                         for sid, title, label, slug, path, _started, hits in sess],
+            "count": len(mem),
+            "session_count": len(sess),
+        })
         return EXIT_OK
-    if not results:
+
+    if not mem and not sess:
         print("No matches.")
         return EXIT_OK
-    for score, it, snippet in results:
-        print("• %s  [%s/%s]" % (it.title, it.project, it.agent))
-        if snippet:
-            print("    %s" % snippet)
+    if want_mem:
+        print("memories (%d):" % len(mem))
+        for score, it, snippet in mem:
+            print("• %s  [%s/%s]" % (it.title, it.project, it.agent))
+            if snippet:
+                print("    %s" % snippet)
+    if want_sess:
+        print("sessions (%d):" % len(sess))
+        for sid, title, label, slug, path, _started, hits in sess:
+            print("• %s  [%s]  (%d hit%s)"
+                  % (title or sid, label, len(hits), "" if len(hits) == 1 else "s"))
+            for h in hits[:SESSION_SEARCH_SHOW]:
+                print("    %-10s %s" % (h["role"] + ":", h["snippet"] or ""))
+            if len(hits) > SESSION_SEARCH_SHOW:
+                print("    … and %d more" % (len(hits) - SESSION_SEARCH_SHOW))
     return EXIT_OK
 
 
@@ -1626,11 +1780,19 @@ def build_parser():
                    help="within each project: name = A–Z by title (default), mtime = newest first")
     p.set_defaults(func=cmd_ls)
 
-    p = sub.add_parser("search", parents=[common], help="search memories")
+    p = sub.add_parser("search", parents=[common],
+                       help="search memories AND session transcripts")
     p.add_argument("query")
     p.add_argument("--type")
     p.add_argument("--project")
-    p.add_argument("--field", choices=["title", "description", "body", "all"], default="all")
+    p.add_argument("--field", choices=["title", "description", "body", "all"], default="all",
+                   help="which memory field(s) to match (sessions always match conversation text)")
+    p.add_argument("--memories-only", dest="memories_only", action="store_true",
+                   help="search memories only (offline; skip transcripts)")
+    p.add_argument("--sessions-only", dest="sessions_only", action="store_true",
+                   help="search session transcripts only")
+    p.add_argument("--all", action="store_true",
+                   help="in sessions, also search tool inputs/results (heavier)")
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("show", parents=[common], help="show a memory + its links")
